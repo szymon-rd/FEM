@@ -1,31 +1,24 @@
 package com.unihogsoft.rurki
 
+import java.lang.Math._
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
+
 import com.unihogsoft.rurki
 import org.apache.commons.math3.analysis.integration.IterativeLegendreGaussIntegrator
 import org.apache.commons.math3.linear.{Array2DRowRealMatrix, ArrayRealVector, DecompositionSolver, LUDecomposition}
+import rurki._
+import FEMCalculator._
 
-object FEMCalculator {
+import scala.concurrent.{ExecutionContext, Future}
 
-  trait Expression[Arg] {
-    def calculate(arg: Arg): Double
-  }
+case class FEMCalculator(integrationPoints: Int) {
 
-  case class Sum[Arg](elements: Expression[Arg]*) extends Expression[Arg] {
-    override def calculate(arg: Arg): Double =
-      elements.map(_.calculate(arg)).sum
-  }
-
-  case class ArgFn[Arg](fn: Arg => Double) extends Expression[Arg] {
-    override def calculate(arg: Arg): Double = fn(arg)
-  }
-
-
-  case class Integrate[Arg](fn: (Arg, Double) => Double, from: Double, to: Double) extends Expression[Arg] {
-    override def calculate(arg: Arg): Double = {
-      val integrator = new IterativeLegendreGaussIntegrator(16, 1e-5, 1e-5 )
-      integrator.integrate(Integer.MAX_VALUE, x => fn(arg, x), from, to)
-    }
-  }
+  private implicit val integrator = ThreadLocal.withInitial(
+    () => new IterativeLegendreGaussIntegrator(integrationPoints, 1e-5, 1e-5 )
+  )
+  implicit val integratorProvider: IntegratorProvider = () => integrator.get()
+  private implicit val ec = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(Runtime.getRuntime.availableProcessors() * 4))
 
   private def baseFn(n: Int, from: Double, to: Double): Base = (i: Int) => {
     val step = (to - from ) / n
@@ -40,7 +33,7 @@ object FEMCalculator {
       case _ => (0, 0)
     }
 
-    FnWithDv(x => fn(x)._1, x => fn(x)._2)
+    (FnWithDv(x => fn(x)._1, x => fn(x)._2), (start, end))
   }
 
   def E(x: Double): Double = if(x < 1) 3 else 5
@@ -59,7 +52,7 @@ object FEMCalculator {
     coeff: Array[Double],
     points: Int
   ): FnPlotWithBases = {
-    val baseFns = (0 to n).map(base).map(_.fn)
+    val baseFns = (0 to n).map(base).map(_._1.fn)
     val weightedFns = baseFns.zip(coeff).map{
       case (f: Fn, w: Double) => (x: Double) => w * f(x)
     }
@@ -82,18 +75,86 @@ object FEMCalculator {
     (fnPlot, basesPlot)
   }
 
-  def calculate(n: Int): FnPlotWithBases = {
+  private def combineRange(a: Range, b: Range, limit: Range): Range = (a, b, limit) match {
+    case ((aStart, aEnd), (bStart, bEnd), (limitStart, limitEnd)) =>
+      (max(min(aStart, bStart), limitStart), min(max(aEnd, bEnd), limitEnd))
+  }
+
+  private def threadsafeProgressReporter(progressReporter: Double => Unit, totalOps: Int) = {
+    val progress = new AtomicInteger()
+    () => {
+      val toReport = progress.incrementAndGet().toDouble / totalOps
+      progressReporter(toReport)
+    }
+  }
+
+  def calculate(n: Int, progressReporter: Double => Unit): Future[FnPlotWithBases] = {
     val start = 0
     val end = 2
+    val limitRange = (start.toDouble, end.toDouble)
     val base = baseFn(n, start, end)
-    val coefficients = Array.tabulate(n, n)((x, y) => {
-      println(s"Calculating for ${x} $y")
-      bEquation.calculate(base(x), base(y))
+    val reporter = threadsafeProgressReporter(progressReporter, n * 3)
+    val coefficientsFuture: List[List[Future[Double]]] = List.tabulate(n, n)((x, y) => Future {
+      if(abs(x - y) <= 1) {
+        val (baseX, rangeX) = base(x)
+        val (baseY, rangeY) = base(y)
+        val arg = (baseX, baseY)
+        val range = combineRange(rangeX, rangeY, limitRange)
+        val result = bEquation.calculate(arg, range)
+        reporter()
+        result
+      } else 0
     })
-    val matrix = new Array2DRowRealMatrix(coefficients)
-    val constants = new ArrayRealVector(Array.tabulate(n)(i => lEquation.calculate(base(i))))
-    val solver = new LUDecomposition(matrix).getSolver
-    val result = solver.solve(constants).toArray
-    composeFunction(n, start, end, base, result, 1024)
+    Future.sequence(coefficientsFuture.map(x => Future.sequence(x)))
+      .map(_.map(_.toArray).toArray).map { coefficients =>
+      val matrix = new Array2DRowRealMatrix(coefficients)
+      val constants = new ArrayRealVector(Array.tabulate(n)(i => (lEquation.calculate _).tupled(base(i))))
+      val solver = new LUDecomposition(matrix).getSolver
+      val result = solver.solve(constants).toArray
+      composeFunction(n, start, end, base, result, 1024)
+    }
+  }
+}
+
+object FEMCalculator {
+  type UV = (FnWithDv, FnWithDv)
+  type V = FnWithDv
+  type Range = (Double, Double)
+  type Base = Int => (FnWithDv, Range)
+
+  type FnPlot = List[(Double, Double)]
+  type FnPlotWithBases = (FnPlot, List[FnPlot])
+  type Fn = Double => Double
+  type IntegratorProvider = () => IterativeLegendreGaussIntegrator
+  case class FnWithDv(
+    fn: Fn, dv: Fn
+  ) {
+    def apply(x: Double): Double = fn(x)
+  }
+
+  def ∫(fn: (FnWithDv, FnWithDv, Double) => Double, from: Double, to: Double)(implicit integrator: IntegratorProvider): Integrate[UV] =
+    Integrate((arg, x) => fn(arg._1, arg._2, x), from, to)
+  def ∑[T](xs: Expression[T]*): Sum[T] = Sum.apply(xs: _*)
+  def λ(fn: (FnWithDv, FnWithDv) => Double): ArgFn[UV] = ArgFn(fn.tupled)
+  def λ(fn: (FnWithDv) => Double): ArgFn[V] = ArgFn(fn)
+
+  trait Expression[Arg] {
+    def calculate(arg: Arg, nonzeroRange: Range): Double
+  }
+
+  case class Sum[Arg](elements: Expression[Arg]*) extends Expression[Arg] {
+    override def calculate(arg: Arg, nonzeroRange: Range): Double =
+      elements.map(_.calculate(arg, nonzeroRange)).sum
+  }
+
+  case class ArgFn[Arg](fn: Arg => Double) extends Expression[Arg] {
+    override def calculate(arg: Arg, nonzeroRange: Range): Double = fn(arg)
+  }
+
+
+  case class Integrate[Arg](fn: (Arg, Double) => Double, from: Double, to: Double)(implicit integrator: IntegratorProvider) extends Expression[Arg] {
+    override def calculate(arg: Arg, nonzeroRange: Range): Double = {
+      integrator().integrate(Integer.MAX_VALUE, x => fn(arg, x), nonzeroRange._1, nonzeroRange._2)
+    }
   }
 }
