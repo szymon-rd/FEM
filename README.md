@@ -1,3 +1,3 @@
 # FEM
 
-Solver of elastic deformation problem using Finite Elements Method. 
+Solver for elastic deformation problem using Finite Elements Method. 
