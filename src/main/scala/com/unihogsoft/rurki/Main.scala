@@ -76,7 +76,7 @@ object Main extends JFXApp {
 
   stage = new PrimaryStage {
     title = "FEM"
-    scene = new Scene(800, 600) {
+    scene = new Scene(1024, 600) {
       root = new BorderPane {
         center = lineChart
         bottom = new HBox {

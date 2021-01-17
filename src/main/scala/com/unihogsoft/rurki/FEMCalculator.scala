@@ -88,7 +88,7 @@ case class FEMCalculator(integrationPoints: Int) {
     }
   }
 
-  def calculate(n: Int, progressReporter: Double => Unit): Future[FnPlotWithBases] = {
+  def calculate(n: Int, progressReporter: Double => Unit): Future[FnPlotWithBases] = timed {
     val start = 0
     val end = 2
     val limitRange = (start.toDouble, end.toDouble)
@@ -106,11 +106,16 @@ case class FEMCalculator(integrationPoints: Int) {
       } else 0
     })
     Future.sequence(coefficientsFuture.map(x => Future.sequence(x)))
-      .map(_.map(_.toArray).toArray).map { coefficients =>
+      .map(_.map(_.toArray).toArray)
+      .flatMap { coeff =>
+        val list = List.tabulate(n)(i => Future((lEquation.calculate _).tupled(base(i))))
+        val constants = Future.sequence(list)
+        constants.map(c => (coeff, c.toArray))
+      }.map { case (coefficients, constants) =>
       val matrix = new Array2DRowRealMatrix(coefficients)
-      val constants = new ArrayRealVector(Array.tabulate(n)(i => (lEquation.calculate _).tupled(base(i))))
+      val constantsVec = new ArrayRealVector(constants)
       val solver = new LUDecomposition(matrix).getSolver
-      val result = solver.solve(constants).toArray
+      val result = solver.solve(constantsVec).toArray
       composeFunction(n, start, end, base, result, 1024)
     }
   }
